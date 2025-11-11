@@ -1,0 +1,698 @@
+﻿
+
+
+/*
+* 亚像素边缘检测
+*/
+
+
+
+//#define GTest
+
+#ifndef FALSE
+#define FALSE 0
+#endif /* !FALSE */
+
+#ifndef TRUE
+#define TRUE 1
+#endif /* !TRUE */
+
+#include "CannyDevernay.h"
+#include <fstream>
+
+
+/*----------------------------------------------------------------------------*/
+/* fatal error, print a message to standard error and exit
+ */
+static void error(std::string str)
+{
+    std::cerr << "Error" << str << std::endl;
+    std::cout << "erro " << str << std::endl;
+    exit(EXIT_FAILURE);
+}
+
+/*----------------------------------------------------------------------------*/
+/* Euclidean distance between x1,y1 and x2,y2
+ */
+static double dist(double x1, double y1, double x2, double y2)
+{
+    return sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
+}
+inline int idx(int x, int y, int X) { return y * X + x; }
+
+
+
+/*----------------------------------------------------------------------------*/
+/* compute the image gradient, giving its x and y components as well as the
+   modulus. Gx, Gy, and modG must be already allocated.
+ */
+static void compute_gradient(cv::Mat& Gx, cv::Mat& Gy, cv::Mat& modG,
+    cv::Mat& image, int X, int Y) {
+
+    /* check input */
+    if (Gx.data == NULL || Gy.data == NULL || modG.data == NULL || image.data == NULL)
+        error("compute_gradient: invalid input");
+
+
+    /* approximate image gradient using centered differences  后一列减前一列  后一行减前一行 计算图像的梯度*/
+    /*
+           中心差分
+           Gx​(x,y)=I(x+1,y)−I(x−1,y)
+           Gy​(x,y)=I(x,y+1)−I(x,y−1)
+    */
+    for (int x = 1; x < X - 1; x++) {
+        for (int y = 1; y < Y - 1; y++) {
+
+            Gx.at<double>(y, x) = image.at<double>(y, x + 1) - image.at<double>(y, x - 1);
+            Gy.at<double>(y, x) = image.at<double>(y + 1, x) - image.at<double>(y - 1, x);
+            modG.at<double>(y, x) = sqrt(std::pow(Gx.at<double>(y, x), 2) + std::pow(Gy.at<double>(y, x), 2));
+        }
+
+    }
+
+
+}
+/*----------------------------------------------------------------------------*/
+/* compute a Gaussian kernel of length n, standard deviation sigma,
+   and centered at value mean.
+
+   for example, if mean=0.5, the Gaussian will be centered in the middle point
+   between values kernel[0] and kernel[1].
+
+   kernel must be allocated to a size n.
+
+   生成卷积核
+ */
+static void gaussian_kernel(cv::Mat& kernel, int n, double sigma, double mean) {
+
+    double sum = 0.0;
+    double val;
+
+    /* check input */
+    if (kernel.data == NULL)
+        error("gaussian_kernel: kernel not allocated");
+    if (sigma <= 0.0)
+        error("gaussian_kernel: sigma must be positive");
+    /* compute Gaussian kernel */
+    for (int i = 0; i < n; i++) {
+
+        val = (static_cast<double>(i) - mean) / sigma;
+        kernel.at<double>(0, i) = exp(-0.5 * val * val);
+        sum += kernel.at<double>(0, i);
+    }
+
+    /* normalization */
+    if (sum > 0.0) {
+        for (int i = 0; i < n; i++) {
+            kernel.at<double>(0, i) /= sum;
+        }
+    }
+
+
+}
+
+
+/*----------------------------------------------------------------------------*/
+/* filter an image with a Gaussian kernel of parameter sigma. return a pointer
+   to a newly allocated filtered image, of the same size as the input image.
+ */
+static void gaussian_filter(cv::Mat& image, int X, int Y, double sigma, cv::Mat& grad_image) {
+
+
+
+    /* check input */
+    if (sigma <= 0.0)
+        error("gaussian_filter: sigma must be positive");
+    if (image.data == NULL || X < 1 || Y < 1)
+        error("gaussian_filter: invalid image");
+
+    /* compute gaussian kernel */
+    /*
+        The size of the kernel is selected to guarantee that the first discarded
+        term is at least 10^prec times smaller than the central value. For that,
+        the half size of the kernel must be larger than x, with
+          e^(-x^2/2sigma^2) = 1/10^prec
+        Then,
+          x = sigma * sqrt( 2 * prec * ln(10) )  ----- offset
+          截断的位置（即“第一个被舍弃的项”）的值, 要比核中心值（最大值）小10^prec 倍这样才能保证数值误差很小。
+    */
+
+    double prec = 3.0;
+    int offset = (int)ceil(sigma * sqrt(2.0 * prec * log(10.0)));
+    int n = 1 + 2 * offset;   /* kernel size */
+
+    cv::Mat kernel(1, n, CV_64F);        // 用于存储卷积核  高斯卷积是一种可分离卷积核
+    gaussian_kernel(kernel, n, sigma, static_cast<double>(offset));
+
+
+    // 辅助变量 用于当图像 size*2
+    int nx2 = 2 * X;
+    int ny2 = 2 * Y;
+    double val;
+    cv::Mat tmp(Y, X, CV_64F);
+    cv::Mat out(Y, X, CV_64F);
+
+    // 执行卷积操作  Gx
+    for (int x = 0; x < X; x++) {
+        for (int y = 0; y < Y; y++) {
+            val = 0.0;
+            for (int i = 0; i < n; i++) {
+                int j = x - offset + i;
+                /* symmetry boundary condition  边界条件*/
+                while (j < 0) j += nx2;
+                while (j >= nx2) j -= nx2;
+                if (j >= X) j = nx2 - 1 - j;
+
+                val += image.at<double>(y, j) * kernel.at<double>(0, i);
+            }
+            tmp.at<double>(y, x) = val;
+        }
+
+    }
+
+    // 执行卷积操作  Gy
+    for (int x = 0; x < X; x++) {
+        for (int y = 0; y < Y; y++) {
+            val = 0.0;
+            for (int i = 0; i < n; i++) {
+                int j = y - offset + i;
+
+                /* symmetry boundary condition */
+                while (j < 0) j += ny2;
+                while (j >= ny2) j -= ny2;
+                if (j >= Y) j = ny2 - 1 - j;
+
+                val += tmp.at<double>(j, x) * kernel.at<double>(0, i);
+            }
+            out.at<double>(y, x) = val;
+        }
+    }
+
+
+#ifdef GTest
+    cv::Mat mag8U;
+    cv::normalize(out, mag8U, 0, 255, cv::NORM_MINMAX);
+    mag8U.convertTo(mag8U, CV_8U);
+    cv::imwrite("gradient_magnitude.png", mag8U);
+    // 关于cv::Mat 之间的拷贝
+    /*
+        cv::Mat A , B;
+        A = B; 浅拷贝  两者共用同一块地址
+        B.copyTo(A);  深拷贝   比clone更灵活
+    */
+#endif // GTest
+
+    out.copyTo(grad_image);
+
+}
+
+
+
+/*----------------------------------------------------------------------------*/
+/* compute a > b considering the rounding errors due to the representation
+   of double numbers
+ */
+static int greater(double a, double b)
+{
+    if (a <= b) return FALSE;  /* trivial case, return as soon as possible */
+
+    if ((a - b) < 1000 * DBL_EPSILON) return FALSE;
+
+    return TRUE; /* greater */
+}
+
+
+
+static void compute_edge_points(cv::Mat& Ex, cv::Mat& Ey, cv::Mat& modG,
+    cv::Mat& Gx, cv::Mat& Gy, int X, int Y) {
+
+    /* check input */
+    if (Ex.empty() || Ey.empty() || modG.empty() || Gx.empty() || Gy.empty())
+        error("compute_edge_points: invalid input");
+
+    Ex.setTo(-1.0), Ey.setTo(-1.0);   // 记录是否为边缘点
+
+    /* explore pixels inside a 2 pixel margin (so modG[x,y +/- 1,1] is defined) */
+    /*
+    * 当梯度模值满足局部水平方向极大值且梯度更接近水平时 |Gx| >= |Gy|  判定为 水平 边缘
+    * 当梯度值模满足局部垂直方向极大值且梯度方向更接近垂直时|Gx| <= |Gy|  判断为 垂直 边缘
+    * 可能出现相邻两像素相等且同为极大值的情况， 例如边缘恰好位于两像素之间
+    * 根据预设规则， 水平极大值标记为左侧点  垂直极大值标记下方像素
+    * 对应的判断条件为： 左临点 < 当前模值 >= 右临点   下临点 < 当前模值 >= 上临点
+    * 比较是通过greater() 函数实现， 旨在将因舍入产生差异的数值视作相等
+    */
+
+    for (int x = 2; x < X - 2; x++) {
+        for (int y = 2; y < Y - 2; y++) {
+
+            int Dx = 0;            /* interpolation will be along Dx,Dy */
+            int Dy = 0;            /*   which will be selected below    */
+            double mod = modG.at<double>(y, x);       /* modG at pixel              */
+            double L = modG.at<double>(y, x - 1);     /* modG at pixel on the left  */
+            double R = modG.at<double>(y, x + 1);     /* modG at pixel on the right */
+            double U = modG.at<double>(y + 1, x);     /* modG at pixel up           */
+            double D = modG.at<double>(y - 1, x);     /* modG at pixel below        */
+
+            double gx = fabs(Gx.at<double>(y, x));
+            double gy = fabs(Gy.at<double>(y, x));
+
+            if (greater(mod, L) && !greater(R, mod) && gx >= gy) Dx = 1;  // 水平     判断是水平方向极大值  还是竖直方向上的极大值    
+            else if (greater(mod, D) && !greater(U, mod) && gx <= gy) Dy = 1;  // 竖直
+
+            // step2： Devernay sub-pixel correction [2]
+            /*
+            * 边缘点位置的确定是通过沿一维方向对梯度值进行二次插值， 并选取插值函数的及大值点， 该像素必须是局部极大值点
+            * 已知三点的梯度模值分别为
+            *                                          . b
+                                                a .    |
+                 x = -1, |Gx| = a                 |    |    . c
+                 x =  0, |Gx| = b                 |    |    |
+                 x =  1, |Gx| = c               ------------------> x
+                                                 -1    0    1
+              穿过点(-1,a)、(0,b)和(1,c)的抛物线，其极大值点的x坐标为：
+              偏移量 = (a - c) / [2(a - 2b + c)]
+              由于 b >= a 且 b >= c，可得 -0.5 <= 偏移量 <= 0.5
+            */
+
+            if (Dx > 0 || Dy > 0) {
+                /* offset value is in [-0.5, 0.5]   亚像素坐标小于一个整像素*/
+                double a = modG.at<double>(y - Dy, x - Dx);
+                double b = modG.at<double>(y, x);
+                double c = modG.at<double>(y + Dy, x + Dx);
+
+                double offset = 0.5 * (a - c) / (a - b - b + c);
+
+                // 存储亚像素值
+                Ex.at<double>(y, x) = x + offset * Dx;
+                Ey.at<double>(y, x) = y + offset * Dy;
+
+            }
+        }
+    }
+
+
+
+}
+
+
+/*----------------------------------------------------------------------------*/
+/* return a score for chaining pixels 'from' to 'to', favoring closet point:
+   = 0.0 invalid chaining
+   > 0.0 valid forward chaining; the larger the value, the better the chaining
+   < 0.0 valid backward chaining; the smaller the value, the better the chaining
+
+   input:
+     from, to       the two pixel IDs to evaluate their potential chaining
+     Ex[i], Ey[i]   the sub-pixel position of point i, if i is an edge point;
+                    they take values -1,-1 if i is not an edge point
+     Gx[i], Gy[i]   the image gradient at pixel i
+     X, Y           the size of the image
+ */
+static double chain(cv::Point2i from, cv::Point2i to, cv::Mat& Ex, cv::Mat& Ey,
+    cv::Mat& Gx, cv::Mat& Gy, int X, int Y) {
+
+    /* check input */
+    if (Ex.empty() || Ey.empty() || Gx.empty() || Gy.empty())
+        error("chain: invalid input");
+    if (from.x < 0 || from.x >= X || from.y < 0 || from.y >= Y ||
+        to.x < 0 || to.x >= X || to.y < 0 || to.y >= Y)
+        error("chain: one of the points is out the image");
+
+    /* check that the points are different and valid edge points,
+      otherwise return invalid chaining */
+    if (from == to) return 0.0; /* same pixel, not a valid chaining */
+    if (Ex.at<double>(from.y, from.x) < 0.0 || Ey.at<double>(from.y, from.x) < 0.0 || Ex.at<double>(to.y, to.x) < 0.0 || Ey.at<double>(to.y, to.x) < 0.0) {
+        return 0.0;  /* one of them is not an edge point, not a valid chaining */
+    }
+
+
+    /* 在一个好的链接关系中， 梯度方向应该与待连接两点连接方向大致正交
+
+              Gx,Gy
+             |                        ------> dx,dy
+             |               thus
+        from x-------x to             ---> Gy,-Gx  (orthogonal to the gradient)
+
+      当 Gy * dx - Gx * dy > 0 时，对应前向连接；
+      当 Gy * dx - Gx * dy < 0 时，对应后向连接。
+      (人为设计)
+
+      首先验证待连接两点的梯度方向是否一致， 否则返回无效连接
+    */
+
+    double dx, dy;
+    dx = Ex.at<double>(to.y, to.x) - Ex.at<double>(from.y, from.x);
+    dy = Ey.at<double>(to.y, to.x) - Ey.at<double>(from.y, from.x);
+
+    if ((Gy.at<double>(from.y, from.x) * dx - Gx.at<double>(from.y, from.x) * dy) *   // 验证梯度方向是否一致
+        (Gy.at<double>(to.y, to.x) * dx - Gx.at<double>(to.y, to.x) * dy) <= 0.0) {
+        return 0.0;  /* incompatible gradient angles, not a valid chaining */
+
+    }
+
+    /*
+    * 返回链接得分， 正向链接为正， 反向链接为负。 得分与到连接点距离成反比， 优先选择更近的点
+    */
+    double x1 = Ex.at<double>(from.y, from.x);
+    double y1 = Ey.at<double>(from.y, from.x);
+    double x2 = Ex.at<double>(to.y, to.x);
+    double y2 = Ey.at<double>(to.y, to.x);
+    if ((Gy.at<double>(from.y, from.x) * dx - Gx.at<double>(from.y, from.x) * dy) >= 0.0) {
+        return 1.0 / dist(x1, y1, x2, y2);   // 正向链接
+    }
+    else {
+        return -1.0 / dist(x1, y1, x2, y2);  // 反向链接
+    }
+
+}
+
+
+
+/*----------------------------------------------------------------------------*/
+/* chain edge points
+
+   input: Ex and Ey are the sub-pixel coordinates when an edge point is present
+          or -1,-1 otherwise. Gx, Gy and modG are the x and y components and the
+          modulus of the image gradient, respectively. X,Y is the image size.
+
+   output: next and prev will contain the number of next and previous edge
+           points in the chain. when not chained in one of the directions, the
+           corresponding value is set to -1. next and prev must be allocated
+           before calling.
+ */
+static void chain_edge_points(int* next, int* prev, cv::Mat& Ex, cv::Mat& Ey,
+    cv::Mat& Gx, cv::Mat& Gy, int X, int Y) {
+
+    /* check input */
+    if (next == NULL || prev == NULL || Ex.empty() || Ey.empty() || Gx.empty() || Gy.empty())
+        error("chain_edge_points: invalid input");
+
+    /* initialize next and prev as non linked */
+    for (int i = 0; i < X * Y; i++) next[i] = prev[i] = -1;
+
+    /* try each point to make local chains */
+    for (int x = 2; x < X - 2; x++) {
+        for (int y = 2; y < Y - 2; y++) {
+            if (Ex.at<double>(y, x) >= 0 && Ey.at<double>(y, x) >= 0) {  /* 判断是否为边缘点   该方法只插值水平与竖直两个方向*/
+
+                cv::Point2i from(x, y);
+                double fwd_s = 0.0, bck_s = 0.0;
+                cv::Point2i fwd(-1, -1), bck(-1, -1);
+
+                // 搜索邻域
+                for (int i = -2; i <= 2; i++) {
+                    for (int j = -2; j <= 2; j++) {
+                        cv::Point2i to(x + i, y + j);
+                        if (to.x < 0 || to.x >= X || to.y < 0 || to.y >= Y) continue;
+
+                        double s = chain(from, to, Ex, Ey, Gx, Gy, X, Y);
+                        if (s > fwd_s) {
+                            fwd_s = s;
+                            fwd = to;
+                        }
+                        if (s < bck_s) {
+                            bck_s = s;
+                            bck = to;
+                        }
+                    }
+                }
+
+                int from_index = idx(x, y, X);
+                // ----------- forward link -------------
+                if (fwd.x >= 0 && fwd.y >= 0) {
+                    int fwd_index = idx(fwd.x, fwd.y, X);
+                    int alt_index = prev[fwd_index];  // fwd 的前驱
+                    cv::Point2i alt(alt_index % X, alt_index / X);
+
+                    if (next[from_index] != fwd_index &&
+                        (alt_index < 0 || chain(alt, fwd, Ex, Ey, Gx, Gy, X, Y) < fwd_s)) {
+
+                        // 移除旧的 from 链
+                        if (next[from_index] >= 0)
+                            prev[next[from_index]] = -1;
+
+                        next[from_index] = fwd_index;
+
+                        if (alt_index >= 0)
+                            next[alt_index] = -1;
+
+                        prev[fwd_index] = from_index;
+                    }
+                }
+
+                // ----------- backward link -------------
+                if (bck.x >= 0 && bck.y >= 0) {
+                    int bck_index = idx(bck.x, bck.y, X);
+                    int alt_index = next[bck_index];  // bck 的后继
+                    cv::Point2i alt(alt_index % X, alt_index / X);
+
+                    if (prev[from_index] != bck_index &&
+                        (alt_index < 0 || chain(alt, bck, Ex, Ey, Gx, Gy, X, Y) > bck_s)) {
+
+                        if (alt_index >= 0)
+                            prev[alt_index] = -1;
+
+                        next[bck_index] = from_index;
+
+                        if (prev[from_index] >= 0)
+                            next[prev[from_index]] = -1;
+
+                        prev[from_index] = bck_index;
+                    }
+                }
+            }
+        }
+    }
+
+
+
+
+}
+
+/*----------------------------------------------------------------------------*/
+
+static void thresholds_with_hysteresis(int* next, int* prev,
+    cv::Mat& modG, int X, int Y,
+    double th_h, double th_l) {
+
+    /*check input*/
+    if (next == NULL || prev == NULL || modG.empty())
+        error("thresholds_with_hysteresis: invalid input");
+
+    cv::Mat vaild(Y, X, CV_8UC1);  // 用于表示是否为有效边缘点
+    vaild.setTo(0);
+
+    /* validate all edge points over th_h or connected to them and over th_l 按行索引*/
+    for (int col = 0; col < X; col++) {
+        for (int row = 0; row < Y; row++) {
+
+            int index = col + row * X;       /* prev[i]>=0 or next[i]>=0 implies an edge point  找到一个强边缘*/
+            if ((prev[index] >= 0 || next[index] >= 0)) {
+                if (!vaild.at<uchar>(row, col) && modG.at<double>(row, col) >= th_h) {
+
+                    vaild.at<uchar>(row, col) = 1; /* mark as valid the new point */
+
+                    /* follow the chain of edge points forwards */
+                    int k = next[index];
+                    int j = index;
+                    while (k >= 0 && !vaild.at<uchar>(k / X, k % X)) {
+
+                        if (modG.at<double>(k / X, k % X) < th_l) {   //小于最低阈值
+                            next[j] = -1;   /* cut the chain when the point is below th_l 断开后向链接*/
+                            prev[k] = -1;  /* j must be assigned to next[j] and not k,    断开下个连接点的前向链接
+                                          so the loop is chained in this case */
+                            break;
+                        }
+                        else {
+                            vaild.at<uchar>(k / X, k % X) = 1;   /* otherwise mark the new point as valid */
+                            j = k;
+                            k = next[j];
+                        }
+
+                    }
+
+
+
+
+                    /* follow the chain of edge points backwards */
+                    k = prev[index];
+                    j = index;
+                    while (k >= 0 && !vaild.at<uchar>(k / X, k % X)) {
+
+                        if (modG.at<double>(k / X, k % X) < th_l) {   //小于最低阈值
+                            prev[j] = -1;   /* cut the chain when the point is below th_l 断开后向链接*/
+                            next[k] = -1;  /* j must be assigned to next[j] and not k,    断开下个连接点的前向链接
+                                          so the loop is chained in this case */
+                            break;
+                        }
+                        else {
+                            vaild.at<uchar>(k / X, k % X) = 1;   /* otherwise mark the new point as valid */
+                            j = k;
+                            k = prev[j];
+                        }
+
+                    }
+                }
+
+            }
+
+        }
+
+    }
+
+    /* 移除剩余所有无效点 */
+    for (int i = 0; i < X; i++) {
+        for (int j = 0; j < Y; j++) {
+            int p = i + j * X;
+            if ((prev[p] >= 0 || next[p] >= 0) && !vaild.at<uchar>(j, i)) {
+                prev[p] = next[p] = -1;
+            }
+        }
+    }
+
+}
+
+
+static void list_chained_edge_points(double** x, double** y, int* N,
+    int** curve_limits, int* M,
+    int* next, int* prev,
+    cv::Mat& Ex, cv::Mat& Ey, int X, int Y) {
+    int i, k, n;
+
+    *x = (double*)malloc(X * Y * sizeof(double));
+    *y = (double*)malloc(X * Y * sizeof(double));
+    *curve_limits = (int*)malloc(X * Y * sizeof(int));
+    *N = 0;
+    *M = 0;
+
+    /* copy chained edge points to output */
+    for (i = 0; i < X * Y; i++)   /* prev[i]>=0 or next[i]>=0 implies an edge point */
+        if (prev[i] >= 0 || next[i] >= 0)
+        {
+            /* a new chain found, set chain starting index to the current point
+               and then increase the curve counter */
+            (*curve_limits)[*M] = *N;
+            ++(*M);
+
+            /* set k to the beginning of the chain, or to i if closed curve */
+            for (k = i; (n = prev[k]) >= 0 && n != i; k = n);
+
+            /* follow the chain of edge points starting on k */
+            do
+            {
+                /* store the current point coordinates in the output lists */
+                (*x)[*N] = Ex.at<double>(k / X, k % X);
+                (*y)[*N] = Ey.at<double>(k / X, k % X);
+                ++(*N);
+
+                n = next[k];   /* save the id of the next point in the chain */
+
+                next[k] = -1;  /* unlink chains from k so it is not used again */
+                prev[k] = -1;
+
+                k = n;  /* set the current point to the next in the chain */
+            } while (k >= 0); /* continue while there is a next point in the chain */
+        }
+    (*curve_limits)[*M] = *N; /* store end of the last chain */
+}
+
+
+
+void save_edge_points_txt(double** x, double** y, int N, const char* filename)
+{
+    std::ofstream fout(filename);
+    if (!fout) return;
+
+    for (int i = 0; i < N; i++)
+        fout << (*x)[i] << "," << (*y)[i] << "\n";
+
+    fout.close();
+}
+
+
+
+void devernay(double** x, double** y, int* N, int** curve_limits, int* M,    // 输入输出
+    cv::Mat& image, int X, int Y,
+    double sigma, double th_h, double th_l) {
+
+    // 创建存储结果的中间变量
+    cv::Mat Gx(Y, X, CV_64F);        /* grad_x */
+    cv::Mat Gy(Y, X, CV_64F);        /* grad_y */
+    cv::Mat modG(Y, X, CV_64F);      /* |grad| */
+
+    // step2: 生成卷积核  对图像进行卷积
+    cv::Mat gauss;
+    if (sigma == 0.0) compute_gradient(Gx, Gy, modG, image, X, Y);
+    else
+    {
+        gaussian_filter(image, X, Y, sigma, gauss);
+        compute_gradient(Gx, Gy, modG, gauss, X, Y);
+    }
+
+#ifdef GTest
+    cv::FileStorage fsx("Gx.yml", cv::FileStorage::WRITE);
+    fsx << "Gx" << Gx;
+    fsx.release();
+
+    cv::FileStorage fsy("Gy.yml", cv::FileStorage::WRITE);
+    fsy << "Gy" << Gy;
+    fsy.release();
+
+    cv::FileStorage fmod("modG.yml", cv::FileStorage::WRITE);
+    fmod << "modG" << modG;
+    fmod.release();
+#endif // GTest
+
+    cv::Mat Ex(Y, X, CV_64F);        /* edge_x */
+    cv::Mat Ey(Y, X, CV_64F);        /* edge_y */
+    compute_edge_points(Ex, Ey, modG, Gx, Gy, X, Y);
+
+#ifdef GTest
+    cv::FileStorage fesx("Ex.yml", cv::FileStorage::WRITE);
+    fesx << "Ex" << Ex;
+    fesx.release();
+
+    cv::FileStorage fesy("Ey.yml", cv::FileStorage::WRITE);
+    fesy << "Ey" << Ey;
+    fesy.release();
+#endif // GTest
+
+    int* next = (int*)malloc(X * Y * sizeof(int));
+    int* prev = (int*)malloc(X * Y * sizeof(int));
+    chain_edge_points(next, prev, Ex, Ey, Gx, Gy, X, Y);
+
+#ifdef GTest
+    //  打开输出文件
+    std::ofstream file("next.txt");
+    for (int i = 0; i < X * Y; i++) {
+        file << next[i] << std::endl;
+    }
+    file.close();
+
+    std::ofstream file_p("prev.txt");
+    for (int i = 0; i < X * Y; i++) {
+        file_p << prev[i] << std::endl;
+    }
+    file_p.close();
+#endif // GTest
+
+    thresholds_with_hysteresis(next, prev, modG, X, Y, th_h, th_l);
+
+#ifdef GTest
+    //  打开输出文件
+    std::ofstream file1("next_threshold.txt");
+    for (int i = 0; i < X * Y; i++) {
+        file1 << next[i] << std::endl;
+    }
+    file1.close();
+#endif // GTest
+
+
+    list_chained_edge_points(x, y, N, curve_limits, M, next, prev, Ex, Ey, X, Y);
+
+#ifdef GTest
+    save_edge_points_txt(x, y, X * Y, "sub_pixel.txt");
+#endif // GTest
+
+
+}
